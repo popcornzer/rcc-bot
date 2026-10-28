@@ -2,13 +2,14 @@
 
 Environment variables:
   DATABASE_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_ALLOWED_IDS
-  (ไม่บังคับ) DEFAULT_PERSON=Pop  SPLIT_PEOPLE=Pop,Tim
+  (ไม่บังคับ) DEFAULT_PERSON=Pop  SPLIT_PEOPLE=Pop,Tim  PARTNER_NAME=Tim  PARTNER_TITLE=คุณไชยพร
 """
 import hmac
 import json
 import os
 import re
 import urllib.request
+from html import escape as h
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler
 
@@ -36,7 +37,7 @@ HELP = """🧾 พิมพ์ข้อความเพื่อบันท�
 • กาแฟ 54 uob one เมื่อวาน  (หรือ 25/10)
 • ค่าห้อง 1500 pa งวด dec
 
-/summary สรุปงวดล่าสุด
+/summary สรุปงวดล่าสุด (หรือ /summary dec ระบุเดือน) พร้อมข้อความแจ้งยอด Tim
 /undo ยกเลิกรายการที่เพิ่งบันทึก"""
 
 
@@ -239,23 +240,36 @@ def saved_text(p):
     return "\n".join(lines)
 
 
-def summary_text(cur, owner):
-    cur.execute("SELECT period FROM expenses ORDER BY id DESC LIMIT 1")
-    r = cur.fetchone()
-    if not r:
-        return "ยังไม่มีข้อมูล"
-    period = r["period"]
+def summary_text(cur, owner, partner, title, month=None, today=None):
+    """สรุปงวด + ข้อความแจ้งยอดค้างของ partner (HTML: แตะ <code> เพื่อคัดลอกใน Telegram)"""
+    if month:
+        period = pick_period(month, today)
+    else:
+        cur.execute("SELECT period FROM expenses ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        if not r:
+            return "ยังไม่มีข้อมูล"
+        period = r["period"]
     cur.execute("SELECT COALESCE(SUM(amount) FILTER (WHERE name=%s),0)::float AS pop, "
+                "COALESCE(SUM(amount) FILTER (WHERE name=%s),0)::float AS partner, "
                 "COALESCE(SUM(amount) FILTER (WHERE type NOT IN ('','-')),0)::float AS card, "
                 "COALESCE(SUM(amount) FILTER (WHERE name NOT IN ('','-')),0)::float AS person "
-                "FROM expenses WHERE period=%s", (owner, period))
+                "FROM expenses WHERE period=%s", (owner, partner, period))
     s = cur.fetchone()
+    if not s["card"] and not s["person"]:
+        return f"งวด {plabel(period)} ยังไม่มีรายการ"
     cur.execute("SELECT salary::float AS s FROM period_salary WHERE period<=%s ORDER BY period DESC LIMIT 1", (period,))
     sal = cur.fetchone()
     out = [f"📊 งวด {plabel(period)}"]
     if sal:
         out.append(f"💰 เงินเดือนคงเหลือ {money(sal['s'] - s['pop'])} (ฐาน ฿{sal['s']:,.0f})")
-    out += [f"{owner} {money(s['pop'])}", f"รวมทุกบัตร {money(s['card'])} · รวมทุกคน {money(s['person'])}"]
+    out += [f"{h(owner)} {money(s['pop'])}", f"{h(partner)} {money(s['partner'])}",
+            f"รวมทุกบัตร {money(s['card'])} · รวมทุกคน {money(s['person'])}"]
+    if s["partner"] > 0:
+        msg = f"เรียน{title} ยอดค้างชำระ จำนวน {s['partner']:,.2f} บาท กำหนดจ่ายภายในสิ้นเดือนครับ"
+        out += ["", "📩 ข้อความแจ้งยอด (แตะเพื่อคัดลอก)", f"<code>{h(msg)}</code>"]
+    else:
+        out.append(f"{h(partner)} ไม่มียอดค้างในงวดนี้")
     return "\n".join(out)
 
 
@@ -299,22 +313,31 @@ def handle_update(upd, cur, today=None):
         return []
     chat_id, uid = msg["chat"]["id"], (msg.get("from") or {}).get("id")
 
-    def say(text, markup=None):
+    def say(text, markup=None, parse_mode=None):
         payload = {"chat_id": chat_id, "text": text}
         if markup:
             payload["reply_markup"] = markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         return [("sendMessage", payload)]
 
     if uid not in allowed:
         return say(f"⛔ ไม่มีสิทธิ์ใช้งานบอทนี้\nID ของคุณ: {uid}\n(เจ้าของนำเลขนี้ไปใส่ใน TELEGRAM_ALLOWED_IDS)")
 
     text = msg["text"].strip()
+    today = today or datetime.now(TZ).date()
     if text.startswith("/"):
         cmd = text.split()[0].split("@")[0].lower()
         if cmd in ("/start", "/help"):
             return say(HELP)
         if cmd == "/summary":
-            return say(summary_text(cur, owner))
+            parts = text.split()
+            month = month_of(parts[1]) if len(parts) > 1 else None
+            if len(parts) > 1 and not month:
+                return say("ใช้แบบ /summary หรือ /summary dec (ระบุเดือน)")
+            partner = os.environ.get("PARTNER_NAME", "Tim")
+            title = os.environ.get("PARTNER_TITLE", "คุณไชยพร")
+            return say(summary_text(cur, owner, partner, title, month, today), parse_mode="HTML")
         if cmd == "/undo":
             key = f"tg_last_{chat_id}"
             cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
@@ -331,7 +354,6 @@ def handle_update(upd, cur, today=None):
     cards = [r["name"] for r in ref if r["name"]]
     bill_days = {r["name"]: r["bill_day"] for r in ref if r["bill_day"]}
     split_people = [x.strip() for x in os.environ.get("SPLIT_PEOPLE", "Pop,Tim").split(",") if x.strip()]
-    today = today or datetime.now(TZ).date()
     p, err = parse_message(text, cards, bill_days, today, owner, split_people)
     if err:
         return say(f"❓ {err}\n\nตัวอย่าง: tops 450 kfc pop\nพิมพ์ /help ดูวิธีใช้ทั้งหมด")
