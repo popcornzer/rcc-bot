@@ -181,7 +181,8 @@ def parse_message(text, cards, bill_days, today, default_person="Pop", split_peo
     fallback = f"{today.year}-{today.month:02d}"
     period = pick_period(period_month, today) if period_month else period_for(d, bill_days.get(card), fallback)
     return dict(amount=amount, item=item, card=card, persons=persons, date=d, period=period,
-                inst_no=inst_no, inst_total=inst_total, period_forced=bool(period_month)), None
+                inst_no=inst_no, inst_total=inst_total, period_forced=bool(period_month),
+                bill_known=bool(card and bill_days.get(card))), None
 
 
 # ---------------- ฐานข้อมูล ----------------
@@ -235,8 +236,12 @@ def saved_text(p):
     if p["inst_no"]:
         meta.append(f"ผ่อน {p['inst_no']}/{p['inst_total']}" if p["inst_total"] else f"ผ่อน #{p['inst_no']}")
     lines.append(" · ".join(meta))
-    if not p["card"]:
-        lines.append("⚠️ ไม่ได้ระบุบัตร จึงนับงวดตามเดือนปัจจุบัน")
+    if not p["period_forced"]:
+        if not p["card"]:
+            lines.append("⚠️ ไม่ได้ระบุบัตร จึงนับงวดตามเดือนปัจจุบัน (ผิดงวดให้ /undo แล้วพิมพ์ใหม่ใส่ งวด dec)")
+        elif not p["bill_known"]:
+            lines.append(f"⚠️ บัตร {p['card']} ยังไม่ได้ตั้งวันตัด จึงนับงวดตามเดือนปัจจุบัน "
+                         "(ตั้งได้ในแอป แท็บ ⚙️ ตั้งค่า)")
     return "\n".join(lines)
 
 
