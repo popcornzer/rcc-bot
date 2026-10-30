@@ -85,7 +85,8 @@ def pick_period(month, today):
 
 
 # ---------------- แปลงข้อความ -> รายการ ----------------
-def parse_message(text, cards, bill_days, today, default_person="Pop", split_people=("Pop", "Tim")):
+def parse_message(text, cards, bill_days, today, default_person="Pop", split_people=("Pop", "Tim"),
+                  current_period=None):
     """คืน (dict, None) หรือ (None, ข้อความ error)"""
     toks = text.replace("฿", " ").replace("บาท", " ").split()
     used = [False] * len(toks)
@@ -178,7 +179,7 @@ def parse_message(text, cards, bill_days, today, default_person="Pop", split_peo
         persons = list(split_people)
     if not persons:
         persons = [default_person]
-    fallback = f"{today.year}-{today.month:02d}"
+    fallback = current_period or f"{today.year}-{today.month:02d}"   # ไม่รู้งวด -> ใช้งวดปัจจุบันที่ตั้งไว้ในแอป
     period = pick_period(period_month, today) if period_month else period_for(d, bill_days.get(card), fallback)
     return dict(amount=amount, item=item, card=card, persons=persons, date=d, period=period,
                 inst_no=inst_no, inst_total=inst_total, period_forced=bool(period_month),
@@ -238,17 +239,26 @@ def saved_text(p):
     lines.append(" · ".join(meta))
     if not p["period_forced"]:
         if not p["card"]:
-            lines.append("⚠️ ไม่ได้ระบุบัตร จึงนับงวดตามเดือนปัจจุบัน (ผิดงวดให้ /undo แล้วพิมพ์ใหม่ใส่ งวด dec)")
+            lines.append(f"⚠️ ไม่ได้ระบุบัตร จึงนับเป็นงวดปัจจุบัน ({plabel(p['period'])}) "
+                         "(ผิดงวดให้ /undo แล้วพิมพ์ใหม่ใส่ งวด dec)")
         elif not p["bill_known"]:
-            lines.append(f"⚠️ บัตร {p['card']} ยังไม่ได้ตั้งวันตัด จึงนับงวดตามเดือนปัจจุบัน "
+            lines.append(f"⚠️ บัตร {p['card']} ยังไม่ได้ตั้งวันตัด จึงนับเป็นงวดปัจจุบัน ({plabel(p['period'])}) "
                          "(ตั้งได้ในแอป แท็บ ⚙️ ตั้งค่า)")
     return "\n".join(lines)
 
 
-def summary_text(cur, owner, partner, title, month=None, today=None):
+def get_current_period(cur):
+    cur.execute("SELECT value FROM settings WHERE key=%s", ("current_period",))
+    r = cur.fetchone()
+    return r["value"] if r and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", r["value"]) else None
+
+
+def summary_text(cur, owner, partner, title, month=None, today=None, current_period=None):
     """สรุปงวด + ข้อความแจ้งยอดค้างของ partner (HTML: แตะ <code> เพื่อคัดลอกใน Telegram)"""
     if month:
         period = pick_period(month, today)
+    elif current_period:
+        period = current_period
     else:
         cur.execute("SELECT period FROM expenses ORDER BY id DESC LIMIT 1")
         r = cur.fetchone()
@@ -342,7 +352,7 @@ def handle_update(upd, cur, today=None):
                 return say("ใช้แบบ /summary หรือ /summary dec (ระบุเดือน)")
             partner = os.environ.get("PARTNER_NAME", "Tim")
             title = os.environ.get("PARTNER_TITLE", "คุณไชยพร")
-            return say(summary_text(cur, owner, partner, title, month, today), parse_mode="HTML")
+            return say(summary_text(cur, owner, partner, title, month, today, get_current_period(cur)), parse_mode="HTML")
         if cmd == "/undo":
             key = f"tg_last_{chat_id}"
             cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
@@ -359,7 +369,7 @@ def handle_update(upd, cur, today=None):
     cards = [r["name"] for r in ref if r["name"]]
     bill_days = {r["name"]: r["bill_day"] for r in ref if r["bill_day"]}
     split_people = [x.strip() for x in os.environ.get("SPLIT_PEOPLE", "Pop,Tim").split(",") if x.strip()]
-    p, err = parse_message(text, cards, bill_days, today, owner, split_people)
+    p, err = parse_message(text, cards, bill_days, today, owner, split_people, get_current_period(cur))
     if err:
         return say(f"❓ {err}\n\nตัวอย่าง: tops 450 kfc pop\nพิมพ์ /help ดูวิธีใช้ทั้งหมด")
     ids = save_expense(cur, chat_id, p)
